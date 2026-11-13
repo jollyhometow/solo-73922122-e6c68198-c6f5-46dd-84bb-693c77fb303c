@@ -53,32 +53,61 @@ def _text(parent: ET.Element, tag: str, value: str | None) -> ET.Element:
     return el
 
 
-def build_catalog_xml(records: list, *, watermark: str, generated_at: str | None = None) -> str:
-    """records 为 sqlite Row；调用方只传 deleted=0 的记录，这里再校验一次。
+def _as_item(rec) -> dict:
+    """统一 sqlite Row 与快照 dict 两种输入；Row 含源端原始元数据。"""
+    if isinstance(rec, dict):
+        return {
+            "identifier": rec["identifier"],
+            "datestamp": rec.get("datestamp"),
+            "deleted": bool(rec.get("deleted", False)),
+            "sets": list(rec.get("sets") or []),
+            "metadata": dict(rec.get("metadata") or {}),
+        }
+    return {
+        "identifier": rec["identifier"],
+        "datestamp": rec["datestamp"],
+        "deleted": bool(rec["deleted"]),
+        "sets": json.loads(rec["sets_json"] or "[]"),
+        "metadata": json.loads(rec["metadata_json"] or "{}"),
+    }
+
+
+def build_catalog_xml(records: list, *, watermark: str, generated_at: str | None = None,
+                      mapping_version_id: int | None = None,
+                      kind: str = "harvest") -> str:
+    """records 为 sqlite Row 或等价 dict（快照）；调用方只传 deleted=0 的数据，这里再校验一次。
 
     输出形如：
-        <catalog xmlns="urn:library:catalog:1" watermark="..." recordCount="...">
+        <catalog xmlns="urn:library:catalog:1" watermark="..." recordCount="..."
+                 kind="harvest|mapping" mappingVersion="...">
           <record identifier="oai:...">
             <datestamp>...</datestamp><setSpec>...</setSpec>
             <metadata><dc:title>...</dc:title>...</metadata>
           </record>
         </catalog>
+
+    mappingVersion 为生成该文件所用主题词映射版本（NULL/缺省表示未应用映射），
+    与水位、文件哈希写在同一份文件、同一条 publications 记录里。
     """
     generated_at = generated_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
     root = ET.Element("catalog", {"xmlns": CATALOG_NS})
     root.set("watermark", watermark)
     root.set("generatedAt", generated_at)
     root.set("recordCount", str(len(records)))
-    for rec in records:
+    root.set("kind", kind)
+    if mapping_version_id is not None:
+        root.set("mappingVersion", str(mapping_version_id))
+    for raw in records:
+        rec = _as_item(raw)
         if rec["deleted"]:
             raise ValueError(f"撤回记录 {rec['identifier']} 不应写入馆藏目录")
         item = ET.SubElement(root, "record")
         item.set("identifier", rec["identifier"])
         _text(item, "datestamp", rec["datestamp"])
-        for set_spec in json.loads(rec["sets_json"] or "[]"):
+        for set_spec in rec["sets"]:
             _text(item, "setSpec", set_spec)
         metadata = ET.SubElement(item, "metadata")
-        for name, values in json.loads(rec["metadata_json"] or "{}").items():
+        for name, values in rec["metadata"].items():
             if not _is_xml_name(name):
                 continue
             for value in values:
@@ -133,17 +162,30 @@ def write_publication(
     *,
     fault: str = FAULT_NONE,
     exit_process=os._exit,
+    mapping_version_id: int | None = None,
+    snapshot: list | None = None,
 ) -> dict:
-    """返回已落库的发布描述；任何失败都抛异常且不改变任何已发布状态。"""
+    """返回已落库的发布描述；任何失败都抛异常且不改变任何已发布状态。
+
+    采集发布时把**原始**活动记录（含未映射的 dc:subject 源值）快照连同
+    mapping_version_id 一起写入 publications 行：新映射与目录在同一事务生效，
+    后续换表可从该快照重算。
+    """
     if fault not in KNOWN_FAULTS:
         raise PublishFault(f"未知故障注入模式: {fault}")
     fault = db.take_publish_fault() or fault
+    # 采集发布的文件内容是源端原始值（不做主题词转换），因此 mapping_version_id
+    # 保持调用方传入值（默认 None = 本文件未应用映射）；只有转换发布才标注版本。
+    if snapshot is None:
+        snapshot = db.active_snapshot()
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # --- 1. 生成 ---
+    # --- 1. 生成（records 仍是源端原始值；采集发布的 mappingVersion 只做版本标注） ---
     try:
-        xml_text = build_catalog_xml(records, watermark=watermark)
+        xml_text = build_catalog_xml(
+            records, watermark=watermark, mapping_version_id=mapping_version_id
+        )
         payload = xml_text.encode("utf-8")
     except Exception as exc:
         raise PublishFault(f"目录生成失败：{exc}") from exc
@@ -192,16 +234,21 @@ def write_publication(
             pass
         raise PublishFault("演示：目录文件已写出但发布登记失败（旧目录仍为当前版本）")
 
-    # --- 4. 水位与文件同一条记录落库 ---
+    # --- 4. 水位、映射版本、快照与文件同一条记录落库 ---
+    import json as _json
+
     try:
         db.record_publication(
             run_id=run_id,
+            kind="harvest",
             watermark=watermark,
             file_path=final_path,
             file_name=final_name,
             record_count=len(records),
             size_bytes=len(payload),
             sha256=digest,
+            mapping_version_id=mapping_version_id,
+            snapshot_json=_json.dumps(snapshot, ensure_ascii=False),
         )
     except Exception as exc:
         # 旧 publications 行未动；新文件成为孤儿
@@ -219,4 +266,5 @@ def write_publication(
         "record_count": len(records),
         "size_bytes": len(payload),
         "sha256": digest,
+        "mapping_version_id": mapping_version_id,
     }

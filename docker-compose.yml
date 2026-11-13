@@ -30,6 +30,8 @@ services:
       PUBLISH_FAILURE_MODE: ${PUBLISH_FAILURE_MODE:-none}
       # 可选：单次后台采集最多页数，演示"继续采集"
       MAX_PAGES_PER_CALL: ${MAX_PAGES_PER_CALL:-}
+      # 主题词转换在生成前暂停的秒数：演示"转换期间采集并发发布，提交时自动重算"
+      MAPPING_APPLY_DELAY: ${MAPPING_APPLY_DELAY:-2}
     ports:
       - "8000:8000"
     volumes:

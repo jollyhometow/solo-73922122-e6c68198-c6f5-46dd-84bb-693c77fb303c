@@ -35,7 +35,11 @@ class HarvestOutcome:
 
 @dataclass
 class Publisher:
-    """把"生成 + 原子发布"包成可替换的发布动作；失败抛异常，旧目录不动。"""
+    """把"生成 + 原子发布"包成可替换的发布动作；失败抛异常，旧目录不动。
+
+    采集发布写原始 dc 值与原始记录快照，文件不做主题词转换（mapping_version_id
+    留空）；主题词映射是独立动作，由 MappingApplier 从该快照重算并另发一版。
+    """
 
     db: Database
     output_dir: str

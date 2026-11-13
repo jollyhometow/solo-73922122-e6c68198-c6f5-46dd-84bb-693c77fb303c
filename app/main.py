@@ -8,6 +8,7 @@ OAI_SOURCE_HOME       演示源首页（默认 http://localhost:8001/）
 PUBLISH_FAILURE_MODE  启动时预置一次性发布故障：none|generate_error|commit_error|
                       crash_before_commit|crash_after_publish
 MAX_PAGES_PER_CALL    单次后台采集最多处理页数（演示分批与续采）
+MAPPING_APPLY_DELAY   主题词转换在"生成前"暂停秒数（演示转换期间采集并发发布，默认 0）
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ import asyncio
 import logging
 import os
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -25,6 +26,7 @@ from fastapi.templating import Jinja2Templates
 from .catalog import KNOWN_FAULTS, cleanup_orphans
 from .db import Database
 from .harvester import HarvestBlocked, Harvester, Publisher
+from .mapping import MAX_MAPPING_ROWS, MappingApplier, MappingValidationError, parse_mapping_csv
 
 log = logging.getLogger("catalog")
 
@@ -39,6 +41,9 @@ if FAILURE_MODE not in KNOWN_FAULTS:
     FAILURE_MODE = "none"
 _raw_max = os.environ.get("MAX_PAGES_PER_CALL", "").strip()
 MAX_PAGES = int(_raw_max) if _raw_max.isdigit() and int(_raw_max) > 0 else None
+_raw_delay = os.environ.get("MAPPING_APPLY_DELAY", "0").strip()
+MAPPING_DELAY = float(_raw_delay) if _raw_delay.replace(".", "", 1).isdigit() else 0.0
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024
 
 _STATUS_LABELS = {
     "running": "采集中",
@@ -97,6 +102,8 @@ def build_app() -> FastAPI:
 
     # 启动恢复：不改动任何"已发布"引用，只把中断状态变成可续采/可重试。
     db.recover_after_restart()
+    # 主题词转换任务：未提交的转失败（最近已提交的 publications 一行不动）。
+    db.recover_mapping_jobs_after_restart()
     cleanup_orphans(
         OUTPUT_DIR,
         keep_paths={row["file_path"] for row in db.query("SELECT file_path FROM publications")},
@@ -115,25 +122,26 @@ def build_app() -> FastAPI:
         Publisher(db, OUTPUT_DIR, fault="none"),
         max_pages_per_call=MAX_PAGES,
     )
+    applier = MappingApplier(db, OUTPUT_DIR, apply_delay=MAPPING_DELAY)
 
-    tasks: dict[int, asyncio.Task] = {}
+    tasks: dict[str, asyncio.Task] = {}
 
-    def spawn(run_id: int, coro) -> None:
-        existing = tasks.get(run_id)
+    def spawn(key: str, coro) -> None:
+        existing = tasks.get(key)
         if existing is not None and not existing.done():
             return
-        task = asyncio.create_task(coro, name=f"harvest-run-{run_id}")
+        task = asyncio.create_task(coro, name=key)
 
         def _done(t: asyncio.Task) -> None:
-            tasks.pop(run_id, None)
+            tasks.pop(key, None)
             if t.cancelled():
                 return
             exc = t.exception()
             if exc is not None:
-                log.error("harvest task failed: %r", exc)
+                log.error("background task %s failed: %r", key, exc)
 
         task.add_done_callback(_done)
-        tasks[run_id] = task
+        tasks[key] = task
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -145,6 +153,7 @@ def build_app() -> FastAPI:
     app = FastAPI(title="机构库 → 馆藏目录采集", lifespan=lifespan)
     app.state.db = db
     app.state.harvester = harvester
+    app.state.applier = applier
 
     templates = Jinja2Templates(directory=os.path.join(HERE, "templates"))
     templates.env.filters["localtime"] = _fmt_local
@@ -183,6 +192,8 @@ def build_app() -> FastAPI:
                 "run_is_active": bool(run and run.is_unresolved),
                 "message": request.query_params.get("message"),
                 "error": request.query_params.get("error"),
+                "mapping_version": db.latest_mapping_version(),
+                "mapping_job": db.unresolved_mapping_job(),
             },
         )
 
@@ -198,7 +209,7 @@ def build_app() -> FastAPI:
             run = await harvester.start(until)
         except (HarvestBlocked, RuntimeError) as exc:
             return RedirectResponse(url=f"/?error={exc}", status_code=303)
-        spawn(run.id, harvester.resume(run.id))
+        spawn(f"harvest-{run.id}", harvester.resume(run.id))
         return RedirectResponse(url=f"/?message=第 {run.id} 轮已在后台开始采集", status_code=303)
 
     @app.post("/harvest/{run_id}/resume")
@@ -206,7 +217,7 @@ def build_app() -> FastAPI:
         run = db.get_run(run_id)
         if run is None or not run.is_unresolved:
             return RedirectResponse(url="/?error=该轮次无需继续", status_code=303)
-        spawn(run_id, harvester.resume(run_id))
+        spawn(f"harvest-{run_id}", harvester.resume(run_id))
         return RedirectResponse(url=f"/?message=第 {run_id} 轮正在后台继续", status_code=303)
 
     @app.post("/harvest/{run_id}/retry-publish")
@@ -215,7 +226,7 @@ def build_app() -> FastAPI:
         if run is None or run.status != "publish_failed":
             return RedirectResponse(url="/?error=该轮次当前不需要重试发布", status_code=303)
         db.begin_publish_retry(run_id)
-        spawn(run_id, harvester.retry_publish_after_begin(run_id))
+        spawn(f"harvest-{run_id}", harvester.retry_publish_after_begin(run_id))
         return RedirectResponse(url=f"/?message=第 {run_id} 轮正在重新发布", status_code=303)
 
     @app.post("/harvest/{run_id}/cancel")
@@ -223,7 +234,7 @@ def build_app() -> FastAPI:
         run = db.get_run(run_id)
         if run is None or not run.is_unresolved:
             return RedirectResponse(url="/?error=该轮次不可放弃", status_code=303)
-        task = tasks.get(run_id)
+        task = tasks.get(f"harvest-{run_id}")
         if task is not None and not task.done():
             return RedirectResponse(url="/?error=采集任务仍在运行，请等其暂停后再放弃", status_code=303)
         db.cancel_run(run_id)
@@ -238,6 +249,102 @@ def build_app() -> FastAPI:
         db.set_meta("publish_fault", mode)
         return RedirectResponse(url=f"/?message=下一次发布将使用故障注入：{mode}", status_code=303)
 
+    # --------------------------------------------------------- 主题词映射页
+    def _mapping_context(request: Request) -> dict:
+        latest_pub = db.latest_publication()
+        latest_version = db.latest_mapping_version()
+        entries = db.mapping_entries(latest_version["id"]) if latest_version else []
+        versions = db.query(
+            """
+            SELECT mv.*,
+                   (SELECT COUNT(*) FROM mapping_jobs j WHERE j.version_id = mv.id) AS job_count
+              FROM mapping_versions mv ORDER BY mv.id DESC LIMIT 20
+            """
+        )
+        return {
+            "request": request,
+            "latest_pub": latest_pub,
+            "latest_version": latest_version,
+            "entries": entries,
+            "versions": versions,
+            "jobs": db.recent_mapping_jobs(20),
+            "unresolved_job": db.unresolved_mapping_job(),
+            "max_rows": MAX_MAPPING_ROWS,
+            "mapping_fault": db.get_meta("mapping_publish_fault") or "none",
+            "message": request.query_params.get("message"),
+            "error": request.query_params.get("error"),
+            "apply_delay": MAPPING_DELAY,
+        }
+
+    @app.get("/mapping", response_class=HTMLResponse)
+    def mapping_page(request: Request):
+        return templates.TemplateResponse(request, "mapping.html", _mapping_context(request))
+
+    @app.post("/mapping/upload")
+    async def mapping_upload(request: Request):
+        form = await request.form()
+        upload: UploadFile | None = form.get("file")
+        if upload is None or not upload.filename:
+            return RedirectResponse(url="/mapping?error=请选择要上传的 CSV 文件", status_code=303)
+        raw = await upload.read(MAX_UPLOAD_BYTES + 1)
+        if len(raw) > MAX_UPLOAD_BYTES:
+            return RedirectResponse(url="/mapping?error=CSV 文件过大（上限 2MB）", status_code=303)
+        try:
+            entries, normalized = parse_mapping_csv(raw)
+        except MappingValidationError as exc:
+            return RedirectResponse(url=f"/mapping?error={exc}", status_code=303)
+        except UnicodeDecodeError:
+            return RedirectResponse(url="/mapping?error=CSV 必须是 UTF-8 编码", status_code=303)
+        version_id = db.create_mapping_version(entries, normalized)
+        return RedirectResponse(
+            url=f"/mapping?message=映射版本+{version_id}+已保存（{len(entries)} 条，整表替换），点“应用到当前目录”生效",
+            status_code=303,
+        )
+
+    @app.post("/mapping/apply")
+    async def mapping_apply(request: Request):
+        form = await request.form()
+        raw_id = str(form.get("version_id", "")).strip()
+        if not raw_id.isdigit() or db.get_mapping_version(int(raw_id)) is None:
+            return RedirectResponse(url="/mapping?error=映射版本不存在", status_code=303)
+        if db.unresolved_mapping_job() is not None:
+            return RedirectResponse(url="/mapping?error=已有主题词转换任务在进行，同期只能应用一份", status_code=303)
+        latest = db.latest_publication()
+        if latest is None:
+            return RedirectResponse(url="/mapping?error=尚无成功发布的目录，请先完成一轮采集", status_code=303)
+        job_id = db.create_mapping_job(int(raw_id), latest["id"])
+        spawn(f"mapping-{job_id}", _run_mapping_job(job_id))
+        return RedirectResponse(
+            url=f"/mapping?message=转换任务+{job_id}+已在后台开始（暂停 {MAPPING_DELAY:g} 秒模拟转换窗口）",
+            status_code=303,
+        )
+
+    async def _run_mapping_job(job_id: int) -> None:
+        try:
+            await applier.apply(job_id)
+        except Exception as exc:  # 失败状态已在 applier 内落库
+            log.error("mapping job %s failed: %r", job_id, exc)
+
+    @app.post("/mapping/fault")
+    async def mapping_fault(request: Request):
+        form = await request.form()
+        mode = str(form.get("fault", "none"))
+        if mode not in KNOWN_FAULTS:
+            return RedirectResponse(url="/mapping?error=未知故障模式", status_code=303)
+        db.set_meta("mapping_publish_fault", mode)
+        return RedirectResponse(url=f"/mapping?message=下一次转换将使用故障注入：{mode}", status_code=303)
+
+    @app.get("/mapping/versions/{version_id}/csv")
+    def mapping_version_csv(version_id: int):
+        version = db.get_mapping_version(version_id)
+        if version is None:
+            raise HTTPException(status_code=404, detail="映射版本不存在")
+        return PlainTextResponse(
+            version["source_csv"],
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="mapping-v{version_id}.csv"'},
+        )
+
     @app.get("/catalog/download")
     def catalog_download():
         latest = db.latest_publication()
@@ -246,11 +353,17 @@ def build_app() -> FastAPI:
         path = latest["file_path"]
         if not os.path.exists(path):
             raise HTTPException(status_code=410, detail="已登记的目录文件缺失")
+        headers = {
+            "X-Catalog-Watermark": latest["watermark"],
+            "X-Catalog-Run": str(latest["run_id"] or ""),
+            "X-Catalog-Kind": latest["kind"],
+            "X-Catalog-Mapping-Version": str(latest["mapping_version_id"] or ""),
+        }
         return FileResponse(
             path,
             media_type="application/xml",
             filename=latest["file_name"],
-            headers={"X-Catalog-Watermark": latest["watermark"], "X-Catalog-Run": str(latest["run_id"])},
+            headers=headers,
         )
 
     @app.get("/catalog.xml")

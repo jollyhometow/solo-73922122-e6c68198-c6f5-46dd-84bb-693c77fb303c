@@ -16,6 +16,7 @@
   <div class="endpoint">
     <span>固定源地址</span><code>{{ endpoint }}</code>
     {% if source_home %}<a href="{{ source_home }}" target="_blank" rel="noopener">本地演示源 »</a>{% endif %}
+    <a href="/mapping" style="color:#fff">主题词映射 »</a>
   </div>
 </header>
 
@@ -106,6 +107,11 @@
     {% if latest %}
       <dl>
         <dt>水位</dt><dd><strong>{{ latest.watermark }}</strong>（与本文件同一次发布）</dd>
+        <dt>类型</dt><dd>
+          {% if latest.kind == 'mapping' %}<span class="pill status-mapping">主题词转换</span>{% else %}<span class="pill">采集发布</span>{% endif %}
+          · 映射版本
+          <strong>{{ latest.mapping_version_id if latest.mapping_version_id is not none else '未应用' }}</strong>
+        </dd>
         <dt>记录</dt><dd>{{ latest.record_count }} 条有效记录</dd>
         <dt>文件</dt><dd><code>{{ latest.file_name }}</code></dd>
         <dt>大小 / SHA-256</dt><dd>{{ latest.size_bytes }} B · <code>{{ latest.sha256[:16] }}…</code></dd>
@@ -113,6 +119,7 @@
       </dl>
       <a class="btn" href="/catalog/download">下载目录 XML</a>
       <a class="btn ghost" href="/catalog.xml" target="_blank">浏览</a>
+      <a class="btn ghost" href="/mapping">管理主题词映射</a>
     {% else %}
       <p class="muted">尚无已发布的目录。完成一轮采集后自动发布。</p>
     {% endif %}
@@ -120,6 +127,13 @@
       <span><strong>{{ active_count }}</strong> 有效</span>
       <span><strong>{{ deleted_count }}</strong> 已撤回（永久保留标记）</span>
     </div>
+    <p class="muted" style="margin-top:10px">
+      当前映射版本：
+      {% if mapping_version %}
+        <a href="/mapping">#{{ mapping_version.id }}（{{ mapping_version.entry_count }} 条）</a>
+      {% else %}无{% endif %}
+      {% if mapping_job %}· <span class="pill status-running">转换中 #{{ mapping_job.id }}</span>{% endif %}
+    </p>
   </div>
 
   <div class="card">
@@ -169,18 +183,20 @@
   <div class="card">
     <h2>发布历史</h2>
     <table class="mini">
-      <thead><tr><th>#</th><th>水位</th><th>记录</th><th>文件</th><th>时间</th></tr></thead>
+      <thead><tr><th>#</th><th>类型</th><th>水位</th><th>映射版本</th><th>记录</th><th>文件</th><th>时间</th></tr></thead>
       <tbody>
       {% for p in publications %}
         <tr>
           <td>{{ p.id }}</td>
+          <td>{% if p.kind == 'mapping' %}<span class="pill status-mapping">转换</span>{% else %}采集{% endif %}</td>
           <td>{{ p.watermark }}</td>
+          <td>{{ p.mapping_version_id if p.mapping_version_id is not none else '—' }}</td>
           <td>{{ p.record_count }}</td>
           <td><code>{{ p.file_name }}</code></td>
           <td>{{ p.published_at|localtime }}</td>
         </tr>
       {% else %}
-        <tr><td colspan="5" class="muted">暂无</td></tr>
+        <tr><td colspan="7" class="muted">暂无</td></tr>
       {% endfor %}
       </tbody>
     </table>

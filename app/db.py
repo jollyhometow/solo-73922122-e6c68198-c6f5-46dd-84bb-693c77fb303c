@@ -4,16 +4,20 @@
 --------
 * ``records`` 按 OAI identifier 唯一；删除只是置 ``deleted=1``，并且永远保留，
   绝不以"本轮未出现"推断删除。
+* ``records.metadata_json`` 永远保存 OAI 源端的**原始** dc 值（含原始 dc:subject）；
+  主题词映射只在生成目录时应用，换表/空表都能从源值重算。
 * 任意时刻最多有一个未解决的采集中/发布中轮次，由部分唯一索引兜底。
-* 发布会写入唯一文件名 + 一条 publications 记录（水位与文件路径同一条记录），
-  下载端只从该记录解析文件，因此进程在发布前后任意点退出，页面水位与下载内容
-  要么都是旧的一整套、要么都是新的一整套。
+* 任意时刻最多有一个未解决的主题词转换任务（``mapping_jobs`` 同样有部分唯一索引）。
+* 每次发布写一条 publications 记录：水位、文件路径、sha256、**主题词映射版本**
+  与**发布时刻的活动记录快照**在同一行；下载端只从该行解析，因此"下载内容 ↔
+  映射版本 ↔ 采集水位"永远对应同一次完整结果。
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
+import hashlib
 import json
 import os
 import sqlite3
@@ -68,19 +72,101 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_runs_unresolved
 
 CREATE TABLE IF NOT EXISTS publications (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id       INTEGER NOT NULL REFERENCES runs(id),
+    run_id       INTEGER REFERENCES runs(id),          -- NULL = 主题词转换发布（非采集轮次）
+    kind         TEXT NOT NULL DEFAULT 'harvest',      -- harvest | mapping
     watermark    TEXT NOT NULL,
     file_path    TEXT NOT NULL UNIQUE,
     file_name    TEXT NOT NULL,
     record_count INTEGER NOT NULL,
     size_bytes   INTEGER NOT NULL,
     sha256       TEXT NOT NULL,
+    mapping_version_id INTEGER REFERENCES mapping_versions(id),
+    snapshot_json TEXT,
     published_at TEXT NOT NULL
 );
+
+-- 上传成功（含校验通过）的主题词映射版本。整表替换：新版本是一份完整映射，
+-- 从不在旧版本上增量合并；entry_count=0 表示空表（恢复源词）。
+CREATE TABLE IF NOT EXISTS mapping_versions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_count INTEGER NOT NULL,
+    source_csv  TEXT NOT NULL,
+    sha256      TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mapping_entries (
+    version_id INTEGER NOT NULL REFERENCES mapping_versions(id) ON DELETE CASCADE,
+    source_term TEXT NOT NULL,
+    target_term TEXT NOT NULL,
+    PRIMARY KEY(version_id, source_term)
+);
+
+-- 主题词转换任务：applied 成功后生成一份与采集发布同构的 publications 行。
+-- 同期只应用一份：running/applying 未结束时部分唯一索引挡住新任务。
+CREATE TABLE IF NOT EXISTS mapping_jobs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_id  INTEGER NOT NULL REFERENCES mapping_versions(id),
+    base_publication_id INTEGER REFERENCES publications(id),
+    status      TEXT NOT NULL,           -- running|applying|failed|completed
+    error_message TEXT,
+    publication_id INTEGER REFERENCES publications(id),
+    started_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    finished_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_mapping_jobs_unresolved
+    ON mapping_jobs((1)) WHERE status IN ('running','applying');
 
 """
 
 UNRESOLVED = ("running", "paused", "publishing", "publish_failed")
+MAPPING_JOB_UNRESOLVED = ("running", "applying")
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对旧版本数据库做幂等迁移（全新库的表已按新 SCHEMA 建好，自动跳过）。
+
+    旧库的 publications 没有 mapping_version_id/snapshot_json 列且 run_id 为
+    NOT NULL；用"建新表 → 拷数据 → 改名"的标准 SQLite 方式重建，已发布的
+    水位/文件引用一行不丢。
+    """
+    cols = {row[1]: row for row in conn.execute("PRAGMA table_info(publications)")}
+    if not cols:
+        return
+    needs_rebuild = (
+        "mapping_version_id" not in cols
+        or "snapshot_json" not in cols
+        or "kind" not in cols
+        or bool(cols["run_id"][3])  # notnull 标志位
+    )
+    if not needs_rebuild:
+        return
+    conn.executescript(
+        """
+        CREATE TABLE publications_new (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id       INTEGER REFERENCES runs(id),
+            kind         TEXT NOT NULL DEFAULT 'harvest',
+            watermark    TEXT NOT NULL,
+            file_path    TEXT NOT NULL UNIQUE,
+            file_name    TEXT NOT NULL,
+            record_count INTEGER NOT NULL,
+            size_bytes   INTEGER NOT NULL,
+            sha256       TEXT NOT NULL,
+            mapping_version_id INTEGER,
+            snapshot_json TEXT,
+            published_at TEXT NOT NULL
+        );
+        INSERT INTO publications_new
+            (id, run_id, kind, watermark, file_path, file_name, record_count, size_bytes,
+             sha256, mapping_version_id, snapshot_json, published_at)
+        SELECT id, run_id, 'harvest', watermark, file_path, file_name, record_count, size_bytes,
+               sha256, NULL, NULL, published_at
+        FROM publications;
+        DROP TABLE publications;
+        ALTER TABLE publications_new RENAME TO publications;
+        """
+    )
 
 
 def utcnow() -> str:
@@ -142,6 +228,8 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.executescript(SCHEMA)
+        with self._lock:
+            _migrate(self._conn)
 
     def close(self) -> None:
         with self._lock:
@@ -429,23 +517,217 @@ class Database:
     def record_publication(
         self,
         *,
-        run_id: int,
+        run_id: int | None,
         watermark: str,
         file_path: str,
         file_name: str,
         record_count: int,
         size_bytes: int,
         sha256: str,
+        kind: str = "harvest",
+        mapping_version_id: int | None = None,
+        snapshot_json: str | None = None,
     ) -> None:
         with self.tx() as conn:
             conn.execute(
                 """
-                INSERT INTO publications(run_id, watermark, file_path, file_name, record_count,
-                                         size_bytes, sha256, published_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO publications(run_id, kind, watermark, file_path, file_name, record_count,
+                                         size_bytes, sha256, mapping_version_id, snapshot_json,
+                                         published_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (run_id, watermark, file_path, file_name, record_count, size_bytes, sha256, utcnow()),
+                (run_id, kind, watermark, file_path, file_name, record_count, size_bytes, sha256,
+                 mapping_version_id, snapshot_json, utcnow()),
             )
 
     def publications(self, limit: int = 20) -> list[sqlite3.Row]:
         return self.query("SELECT * FROM publications ORDER BY id DESC LIMIT ?", limit)
+
+    # --------------------------------------------------------- 主题词映射版本
+    def create_mapping_version(self, entries: list[tuple[str, str]], source_csv: str) -> int:
+        """整表写入一份新映射版本（entries 已通过校验/去重），返回版本 id。"""
+        digest = hashlib.sha256(source_csv.encode("utf-8")).hexdigest()
+        with self.tx() as conn:
+            now = utcnow()
+            cur = conn.execute(
+                "INSERT INTO mapping_versions(entry_count, source_csv, sha256, created_at) "
+                "VALUES(?, ?, ?, ?)",
+                (len(entries), source_csv, digest, now),
+            )
+            version_id = int(cur.lastrowid)
+            conn.executemany(
+                "INSERT INTO mapping_entries(version_id, source_term, target_term) VALUES(?, ?, ?)",
+                [(version_id, s, t) for s, t in entries],
+            )
+        return version_id
+
+    def latest_mapping_version(self) -> sqlite3.Row | None:
+        return self.one("SELECT * FROM mapping_versions ORDER BY id DESC LIMIT 1")
+
+    def get_mapping_version(self, version_id: int) -> sqlite3.Row | None:
+        return self.one("SELECT * FROM mapping_versions WHERE id = ?", version_id)
+
+    def mapping_entries(self, version_id: int) -> list[sqlite3.Row]:
+        return self.query(
+            "SELECT source_term, target_term FROM mapping_entries "
+            "WHERE version_id = ? ORDER BY source_term",
+            version_id,
+        )
+
+    def mapping_dict(self, version_id: int) -> dict[str, str]:
+        return {
+            row["source_term"]: row["target_term"]
+            for row in self.mapping_entries(version_id)
+        }
+
+    def active_snapshot(self) -> list[dict[str, Any]]:
+        """发布时刻活动记录的原始值快照（dc:subject 保持源端原文，不做映射）。"""
+        rows = self.query(
+            "SELECT identifier, datestamp, sets_json, metadata_json FROM records "
+            "WHERE deleted = 0 ORDER BY identifier"
+        )
+        return [
+            {
+                "identifier": row["identifier"],
+                "datestamp": row["datestamp"],
+                "sets": json.loads(row["sets_json"] or "[]"),
+                "metadata": json.loads(row["metadata_json"] or "{}"),
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def decode_snapshot(snapshot_json: str | None) -> list[dict[str, Any]] | None:
+        if not snapshot_json:
+            return None
+        try:
+            data = json.loads(snapshot_json)
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, list) else None
+
+    # ----------------------------------------------------------- 映射转换任务
+    def unresolved_mapping_job(self) -> sqlite3.Row | None:
+        return self.one(
+            f"SELECT * FROM mapping_jobs WHERE status IN "
+            f"({','.join('?' * len(MAPPING_JOB_UNRESOLVED))}) ORDER BY id DESC LIMIT 1",
+            *MAPPING_JOB_UNRESOLVED,
+        )
+
+    def create_mapping_job(self, version_id: int, base_publication_id: int) -> int:
+        with self.tx() as conn:
+            existing = conn.execute(
+                f"SELECT id FROM mapping_jobs WHERE status IN "
+                f"({','.join('?' * len(MAPPING_JOB_UNRESOLVED))}) LIMIT 1",
+                MAPPING_JOB_UNRESOLVED,
+            ).fetchone()
+            if existing is not None:
+                raise RuntimeError(f"已有未结束的主题词转换任务 #{existing['id']}")
+            now = utcnow()
+            cur = conn.execute(
+                "INSERT INTO mapping_jobs(version_id, base_publication_id, status, started_at, updated_at) "
+                "VALUES(?, ?, 'running', ?, ?)",
+                (version_id, base_publication_id, now, now),
+            )
+            return int(cur.lastrowid)
+
+    def mark_mapping_job_applying(self, job_id: int) -> None:
+        with self.tx() as conn:
+            conn.execute(
+                "UPDATE mapping_jobs SET status='applying', updated_at=? "
+                "WHERE id=? AND status IN ('running','applying')",
+                (utcnow(), job_id),
+            )
+
+    def mark_mapping_job_failed(self, job_id: int, message: str) -> None:
+        with self.tx() as conn:
+            conn.execute(
+                "UPDATE mapping_jobs SET status='failed', error_message=?, updated_at=?, finished_at=? "
+                "WHERE id=? AND status IN ('running','applying')",
+                (message[:3000], utcnow(), utcnow(), job_id),
+            )
+
+    def complete_mapping_job(self, job_id: int, publication_id: int) -> None:
+        with self.tx() as conn:
+            conn.execute(
+                "UPDATE mapping_jobs SET status='completed', publication_id=?, error_message=NULL, "
+                "updated_at=?, finished_at=? WHERE id=? AND status IN ('running','applying')",
+                (publication_id, utcnow(), utcnow(), job_id),
+            )
+
+    def get_mapping_job(self, job_id: int) -> sqlite3.Row | None:
+        return self.one("SELECT * FROM mapping_jobs WHERE id = ?", job_id)
+
+    def recent_mapping_jobs(self, limit: int = 20) -> list[sqlite3.Row]:
+        return self.query("SELECT * FROM mapping_jobs ORDER BY id DESC LIMIT ?", limit)
+
+    def recover_mapping_jobs_after_restart(self) -> None:
+        """进程退出后：未提交的转换任务一律转失败，已提交的目录一行不动。
+
+        发布文件与 publications 行在同一事务里落地，因此 running/applying 的任务
+        不可能留下"半套"新目录；重启后最近已提交结果自然保持可用。
+        """
+        with self.tx() as conn:
+            rows = conn.execute(
+                f"SELECT id, publication_id FROM mapping_jobs "
+                f"WHERE status IN ({','.join('?' * len(MAPPING_JOB_UNRESOLVED))})",
+                MAPPING_JOB_UNRESOLVED,
+            ).fetchall()
+            now = utcnow()
+            for row in rows:
+                if row["publication_id"] is not None:
+                    conn.execute(
+                        "UPDATE mapping_jobs SET status='completed', updated_at=?, finished_at=? WHERE id=?",
+                        (now, now, row["id"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE mapping_jobs SET status='failed', error_message=?, "
+                        "updated_at=?, finished_at=? WHERE id=?",
+                        ("进程在主题词转换过程中退出；已提交目录保持不变，请重新应用。", now, now, row["id"]),
+                    )
+
+    def commit_mapping_publication(
+        self,
+        *,
+        job_id: int,
+        base_publication_id: int,
+        watermark: str,
+        file_path: str,
+        file_name: str,
+        record_count: int,
+        size_bytes: int,
+        sha256: str,
+        mapping_version_id: int,
+        snapshot_json: str,
+    ) -> tuple[int, int]:
+        """转换结果落库的关键事务：先复查"基准目录"是否仍是最新发布。
+
+        若采集在此期间发布了新目录（id 变化），返回 (None, latest_id) 让调用方
+        用新快照重算，绝不让迟到的转换覆盖更新的源值。成功则返回 (publication_id, latest_id)。
+        """
+        with self.tx() as conn:
+            latest = conn.execute(
+                "SELECT id FROM publications ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            latest_id = int(latest["id"]) if latest else 0
+            if latest_id != base_publication_id:
+                return None, latest_id
+            now = utcnow()
+            cur = conn.execute(
+                """
+                INSERT INTO publications(run_id, kind, watermark, file_path, file_name, record_count,
+                                         size_bytes, sha256, mapping_version_id, snapshot_json,
+                                         published_at)
+                VALUES(NULL, 'mapping', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (watermark, file_path, file_name, record_count, size_bytes, sha256,
+                 mapping_version_id, snapshot_json, now),
+            )
+            publication_id = int(cur.lastrowid)
+            conn.execute(
+                "UPDATE mapping_jobs SET status='completed', publication_id=?, error_message=NULL, "
+                "updated_at=?, finished_at=? WHERE id=? AND status IN ('running','applying')",
+                (publication_id, now, now, job_id),
+            )
+            return publication_id, latest_id

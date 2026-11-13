@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>主题词映射 · 机构库馆藏目录</title>
+  <link rel="stylesheet" href="/static/style.css">
+  {% if unresolved_job %}<meta http-equiv="refresh" content="2">{% endif %}
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>主题词映射（dc:subject 规范词）</h1>
+    <p class="sub">整表替换 · 最多 {{ max_rows }} 条 · 逐值精确匹配只替换一次 · 源值始终保留，换表从源值重算</p>
+  </div>
+  <div class="endpoint">
+    <a href="/" style="color:#fff">← 返回采集页</a>
+  </div>
+</header>
+
+{% if message %}<div class="banner ok">{{ message }}</div>{% endif %}
+{% if error %}<div class="banner bad">{{ error }}</div>{% endif %}
+
+<main>
+<section class="card">
+  <h2>当前状态</h2>
+  <dl>
+    <dt>最近目录</dt>
+    <dd>
+      {% if latest_pub %}
+        #{{ latest_pub.id }} · 水位 <strong>{{ latest_pub.watermark }}</strong>
+        · 类型 <code>{{ latest_pub.kind }}</code>
+        · 映射版本
+        <strong>{{ latest_pub.mapping_version_id if latest_pub.mapping_version_id is not none else '未应用' }}</strong>
+        · {{ latest_pub.record_count }} 条
+        <a class="btn ghost" href="/catalog/download">下载该目录</a>
+      {% else %}<span class="bad">尚无成功发布的目录，请先在采集页完成一轮采集</span>{% endif %}
+    </dd>
+    <dt>最新映射版本</dt>
+    <dd>
+      {% if latest_version %}
+        #{{ latest_version.id }} · {{ latest_version.entry_count }} 条 ·
+        SHA-256 <code>{{ latest_version.sha256[:16] }}…</code> · {{ latest_version.created_at|localtime }}
+      {% else %}<span class="muted">无（应用空表即恢复源词）</span>{% endif %}
+    </dd>
+    <dt>转换任务</dt>
+    <dd>
+      {% if unresolved_job %}
+        <span class="pill status-running">{{ unresolved_job.status }}</span>
+        任务 #{{ unresolved_job.id }}（页面自动刷新）
+      {% else %}
+        <span class="muted">空闲</span>
+      {% endif %}
+    </dd>
+  </dl>
+  <p class="muted">
+    应用范围固定为最近一次成功发布的目录快照，不含尚未发布的采集记录，也不推进采集水位；
+    转换期间采集可照常发布，提交时若发现目录已更新会自动用新快照重算，迟到处理不覆盖更新的源值或映射。
+    转换暂停窗口：{{ apply_delay|round(1) }} 秒（MAPPING_APPLY_DELAY）。
+  </p>
+</section>
+
+<section class="grid">
+  <div class="card">
+    <h2>上传映射 CSV（整表替换）</h2>
+    <p class="muted">
+      UTF-8 编码、无表头，每行两列：<code>源词,规范词</code>。同一源词出现不同规范词将被拒绝；
+      空文件（0 条）合法，应用后恢复源词。上传只保存新版本，点“应用”才生效。
+    </p>
+    <form method="post" action="/mapping/upload" enctype="multipart/form-data" class="stack">
+      <label>CSV 文件 <input type="file" name="file" accept=".csv,text/csv" required></label>
+      <button class="primary">上传并校验</button>
+    </form>
+    <details style="margin-top:10px">
+      <summary class="muted">示例 CSV</summary>
+      <pre class="code">数字图书馆,数字馆藏
+图书馆学,图书馆学理论
+元数据,元数据规范</pre>
+    </details>
+  </div>
+
+  <div class="card">
+    <h2>应用到当前目录</h2>
+    {% if latest_version and latest_pub and not unresolved_job %}
+      <form method="post" action="/mapping/apply" class="stack">
+        <label>映射版本
+          <select name="version_id">
+            {% for v in versions %}
+              <option value="{{ v.id }}" {% if latest_version and v.id == latest_version.id %}selected{% endif %}>
+                #{{ v.id }}（{{ v.entry_count }} 条，{{ v.created_at|localtime }}）
+              </option>
+            {% endfor %}
+          </select>
+        </label>
+        <button class="primary">应用选中版本（从最近目录快照重算）</button>
+      </form>
+    {% elif unresolved_job %}
+      <p class="hint">转换任务 #{{ unresolved_job.id }} 进行中，同期只能应用一份；请等待其结束。</p>
+    {% else %}
+      <p class="muted">{% if not latest_pub %}请先完成一轮采集。{% else %}请先上传一个映射版本（空表也可）。{% endif %}</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>当前映射内容（最新版本 #{{ latest_version.id if latest_version else '—' }}）</h2>
+  {% if entries %}
+    <table class="mini">
+      <thead><tr><th style="width:45%">源词（精确匹配 dc:subject）</th><th>规范词</th></tr></thead>
+      <tbody>
+      {% for e in entries %}
+        <tr><td><code>{{ e.source_term }}</code></td><td><strong>{{ e.target_term }}</strong></td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <a class="btn ghost" href="/mapping/versions/{{ latest_version.id }}/csv">下载该版本 CSV</a>
+  {% else %}
+    <p class="muted">当前没有映射条目（空表）；应用后目录中的 dc:subject 全部保持源词。</p>
+  {% endif %}
+</section>
+
+<section class="grid">
+  <div class="card">
+    <h2>映射版本历史</h2>
+    <table class="mini">
+      <thead><tr><th>#</th><th>条数</th><th>SHA-256</th><th>创建时间</th><th>CSV</th></tr></thead>
+      <tbody>
+      {% for v in versions %}
+        <tr>
+          <td>{{ v.id }}</td>
+          <td>{{ v.entry_count }}</td>
+          <td><code>{{ v.sha256[:12] }}…</code></td>
+          <td>{{ v.created_at|localtime }}</td>
+          <td><a href="/mapping/versions/{{ v.id }}/csv">下载</a></td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="muted">暂无</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>转换任务历史</h2>
+    <table class="mini">
+      <thead><tr><th>#</th><th>映射版本</th><th>基准目录</th><th>状态</th><th>结果目录</th><th>错误</th></tr></thead>
+      <tbody>
+      {% for j in jobs %}
+        <tr>
+          <td>{{ j.id }}</td>
+          <td>#{{ j.version_id }}</td>
+          <td>#{{ j.base_publication_id }}</td>
+          <td><span class="pill status-{{ j.status }}">{{ j.status }}</span></td>
+          <td>{{ '#' + j.publication_id|string if j.publication_id else '—' }}</td>
+          <td class="muted">{{ j.error_message or '' }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="6" class="muted">暂无</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section class="card">
+  <h2>转换故障演练（一次性）</h2>
+  <form method="post" action="/mapping/fault" class="startform">
+    <label>故障模式
+      <select name="fault">
+        <option value="none" {% if mapping_fault == 'none' %}selected{% endif %}>none（正常）</option>
+        <option value="generate_error" {% if mapping_fault == 'generate_error' %}selected{% endif %}>generate_error（生成失败，旧目录保留）</option>
+        <option value="commit_error" {% if mapping_fault == 'commit_error' %}selected{% endif %}>commit_error（落库失败，旧目录保留）</option>
+        <option value="crash_before_commit" {% if mapping_fault == 'crash_before_commit' %}selected{% endif %}>crash_before_commit（改名前退出）</option>
+        <option value="crash_after_publish" {% if mapping_fault == 'crash_after_publish' %}selected{% endif %}>crash_after_publish（登记前退出）</option>
+      </select>
+    </label>
+    <button class="ghost">预置</button>
+    <span class="muted">当前预置：<code>{{ mapping_fault }}</code>；“进程退出”模式请配合 docker compose restart catalog-web 观察恢复。</span>
+  </form>
+</section>
+</main>
+</body>
+</html>

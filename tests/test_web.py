@@ -19,32 +19,6 @@ from app import oai as oai_mod
 from source.app import create_source_app
 
 
-@pytest.fixture()
-def web(tmp_path, monkeypatch):
-    src_app = create_source_app(str(tmp_path / "source.db"))
-    transport = httpx.ASGITransport(app=src_app)
-
-    async def patched_enter(self):
-        if self._client is None:
-            self._client = httpx.AsyncClient(transport=transport, base_url="http://source")
-        return self
-
-    monkeypatch.setattr(oai_mod.OAIHttpClient, "__aenter__", patched_enter)
-    monkeypatch.setenv("CATALOG_DATA_DIR", str(tmp_path / "web"))
-    monkeypatch.setenv("OAI_ENDPOINT", "http://source/oai")
-    monkeypatch.delenv("PUBLISH_FAILURE_MODE", raising=False)
-    monkeypatch.delenv("MAX_PAGES_PER_CALL", raising=False)
-
-    import importlib
-
-    import app.main as main_mod
-
-    importlib.reload(main_mod)
-    app = main_mod.build_app()
-    with TestClient(app) as client:
-        yield client, app, src_app
-
-
 FINAL = {"completed", "paused", "publish_failed", "canceled"}
 
 
@@ -154,6 +128,17 @@ def test_publish_failure_shows_retry_and_keeps_old_catalog(web):
         time.sleep(0.1)
     assert db.get_run(run.id).status == "completed"
     assert "发布失败改名" in client.get("/catalog/download").text
+
+
+def test_cancel_paused_run_keeps_publication(web):
+    client, app, _ = web
+    db = app.state.db
+    run = db.create_run("full", None, date(2026, 11, 13))
+    db.pause_run(run.id, "interrupted", "测试中断")
+    r = client.post(f"/harvest/{run.id}/cancel", follow_redirects=True)
+    assert r.status_code == 200
+    assert db.get_run(run.id).status == "canceled"
+    assert db.unresolved_run() is None
 
 
 def test_paused_run_has_resume_button(web):

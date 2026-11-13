@@ -17,7 +17,6 @@ import os
 import sqlite3
 import sys
 
-import httpx
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,24 +26,6 @@ from app.db import Database
 from app.harvester import Harvester, Publisher
 from app import oai as oai_mod
 from source.app import create_source_app
-
-
-@pytest.fixture()
-def env(tmp_path):
-    src_app = create_source_app(str(tmp_path / "source.db"))
-    transport = httpx.ASGITransport(app=src_app)
-    orig_enter = oai_mod.OAIHttpClient.__aenter__
-
-    async def patched_enter(self):
-        if self._client is None:
-            self._client = httpx.AsyncClient(transport=transport, base_url="http://source")
-        return self
-
-    oai_mod.OAIHttpClient.__aenter__ = patched_enter
-    try:
-        yield tmp_path, src_app, transport
-    finally:
-        oai_mod.OAIHttpClient.__aenter__ = orig_enter
 
 
 def make(tmp_path, *, max_pages=None, fault="none", exit_process=None):
